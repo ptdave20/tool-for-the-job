@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 	"go.opentelemetry.io/otel"
@@ -22,7 +23,7 @@ func JaegerTracerProvider() (*sdktrace.TracerProvider, error) {
 		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceNameKey.String("golang"),
-			semconv.DeploymentEnvironmentKey.String("production"),
+			semconv.DeploymentEnvironmentKey.String("development"),
 		)),
 	)
 	return tp, nil
@@ -36,14 +37,11 @@ func PostgresMiddleware() gin.HandlerFunc {
 	test := func(ctx context.Context) error {
 		_, span := tracer.Start(ctx, "Ping Postgres")
 		defer span.End()
-
-		_, err = con.Query(ctx, "SELECT 1;")
+		err = con.Ping(ctx)
 		if err != nil {
-			con = nil
 			span.RecordError(err)
 			return err
 		}
-
 		return nil
 	}
 
@@ -83,8 +81,22 @@ func PostgresMiddleware() gin.HandlerFunc {
 			span.End()
 			return
 		}
+		span.End()
 
-		c.Set("pgxConn", con)
+		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), "pgxConn", con))
 		c.Next()
 	}
+}
+
+func GetPostgresConn(c *gin.Context) (*pgx.Conn, error) {
+	pgxInt := c.Request.Context().Value("pgxConn")
+	if pgxInt == nil {
+		return nil, errors.New("No Postgres Connection")
+	}
+	// Validate that it is what we think it should be
+	pgxConn, ok := pgxInt.(*pgx.Conn)
+	if !ok {
+		return nil, errors.New("Postgres Connection is not a *pgx.Conn")
+	}
+	return pgxConn, nil
 }
