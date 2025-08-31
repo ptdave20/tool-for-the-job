@@ -6,6 +6,9 @@ services:
       - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
     ports:
       - "4317:4317" # OTLP gRPC receiver
+      - "4318:4318" # OTLP HTTP receiver (ADD THIS LINE)
+    depends_on:
+      - jaeger
   jaeger:
     image: jaegertracing/all-in-one:latest
     ports:
@@ -18,4 +21,5 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
-
+    depends_on:
+      - otel-collector

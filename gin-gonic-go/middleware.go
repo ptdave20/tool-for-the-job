@@ -6,18 +6,29 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/jaeger"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp" // Changed from jaeger
+	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	"time"
 )
 
-func JaegerTracerProvider() (*sdktrace.TracerProvider, error) {
-	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint("http://localhost:14268/api/traces")))
+// Updated to use OTLP trace exporter instead of deprecated Jaeger exporter
+func OTLPTracerProvider() (*sdktrace.TracerProvider, error) {
+	// Create OTLP HTTP trace exporter
+	exp, err := otlptracehttp.New(
+		context.Background(),
+		// The endpoint is configured via OTEL_EXPORTER_OTLP_TRACES_ENDPOINT environment variable
+		// or defaults to http://localhost:4318/v1/traces
+	)
 	if err != nil {
 		return nil, err
 	}
+
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exp),
 		sdktrace.WithResource(resource.NewWithAttributes(
@@ -27,6 +38,32 @@ func JaegerTracerProvider() (*sdktrace.TracerProvider, error) {
 		)),
 	)
 	return tp, nil
+}
+
+func OTLPMetricsProvider() (*sdkmetric.MeterProvider, error) {
+	// Create OTLP HTTP exporter for metrics
+	exporter, err := otlpmetrichttp.New(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a periodic reader that will push metrics every 30 seconds
+	reader := sdkmetric.NewPeriodicReader(
+		exporter,
+		sdkmetric.WithInterval(30*time.Second),
+	)
+
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String("golang"),
+			semconv.DeploymentEnvironmentKey.String("development"),
+		)),
+	)
+
+	otel.SetMeterProvider(provider)
+	return provider, nil
 }
 
 func PostgresMiddleware() gin.HandlerFunc {
@@ -85,6 +122,41 @@ func PostgresMiddleware() gin.HandlerFunc {
 
 		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), "pgxConn", con))
 		c.Next()
+	}
+}
+
+// Add metrics middleware for Gin
+func MetricsMiddleware() gin.HandlerFunc {
+	meter := otel.Meter("gin-gonic-metrics")
+
+	// Create metrics instruments
+	requestCounter, _ := meter.Int64Counter(
+		"http_requests_total",
+		metric.WithDescription("Total number of HTTP requests"),
+	)
+
+	requestDuration, _ := meter.Float64Histogram(
+		"http_request_duration_seconds",
+		metric.WithDescription("HTTP request duration in seconds"),
+	)
+
+	return func(c *gin.Context) {
+		start := time.Now()
+
+		c.Next()
+
+		duration := time.Since(start).Seconds()
+
+		// Create attributes
+		attrs := []attribute.KeyValue{
+			attribute.String("method", c.Request.Method),
+			attribute.String("route", c.FullPath()),
+			attribute.Int("status_code", c.Writer.Status()),
+		}
+
+		// Record metrics
+		requestCounter.Add(c.Request.Context(), 1, metric.WithAttributes(attrs...))
+		requestDuration.Record(c.Request.Context(), duration, metric.WithAttributes(attrs...))
 	}
 }
 

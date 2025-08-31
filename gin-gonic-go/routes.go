@@ -10,25 +10,24 @@ import (
 func PostTodo(c *gin.Context) {
 	var input Todo
 	if err := c.ShouldBindBodyWithJSON(&input); err != nil {
-		c.AbortWithError(400, err)
+		c.AbortWithStatusJSON(http.StatusBadRequest, err)
 		return
 	}
 
 	dbCon, err := GetPostgresConn(c)
 	if err != nil {
-		c.AbortWithError(500, err)
+		c.AbortWithStatusJSON(http.StatusInternalServerError, err)
 		return
 	}
 
 	result, err := dbCon.Exec(c.Request.Context(), "insert into public.todos (title, done) values ($1, $2)", input.Title, input.Done)
 	if err != nil {
-		c.AbortWithError(500, err)
-		return
+		c.AbortWithStatusJSON(http.StatusInternalServerError, err)
 	}
 
 	if result.RowsAffected() == 0 {
-		c.AbortWithError(500, errors.New("No rows affected"))
-		return
+		c.Error(err)
+		c.AbortWithStatusJSON(http.StatusInternalServerError, "No rows affected")
 	}
 
 	c.Status(http.StatusAccepted)
@@ -43,7 +42,7 @@ func GetTodo(c *gin.Context) {
 
 	rows, err := dbCon.Query(c.Request.Context(), "select id, title, done from public.todos;")
 	if err != nil {
-		c.AbortWithError(500, err)
+		c.AbortWithStatusJSON(http.StatusInternalServerError, err)
 		return
 	}
 	defer rows.Close()
@@ -52,8 +51,8 @@ func GetTodo(c *gin.Context) {
 
 	for rows.Next() {
 		if err = rows.Err(); err != nil {
-			c.AbortWithError(500, err)
-			break
+			c.Error(err)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, err)
 		}
 		var row Todo
 		err := rows.Scan(&row.Id, &row.Title, &row.Done)
