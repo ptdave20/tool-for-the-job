@@ -14,33 +14,34 @@ func PostTodo(c *gin.Context) {
 		return
 	}
 
-	dbCon, err := GetPostgresConn(c)
+	dbPool, err := GetPostgresConn(c)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, err)
 		return
 	}
 
-	result, err := dbCon.Exec(c.Request.Context(), "insert into public.todos (title, done) values ($1, $2)", input.Title, input.Done)
+	result, err := dbPool.Exec(c.Request.Context(), "insert into public.todos (title, done) values ($1, $2)", input.Title, input.Done)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, err)
+		return
 	}
 
 	if result.RowsAffected() == 0 {
-		c.Error(err)
 		c.AbortWithStatusJSON(http.StatusInternalServerError, "No rows affected")
+		return
 	}
 
 	c.Status(http.StatusAccepted)
 }
 
 func GetTodo(c *gin.Context) {
-	dbCon, err := GetPostgresConn(c)
+	dbPool, err := GetPostgresConn(c)
 	if err != nil {
 		c.AbortWithError(500, err)
 		return
 	}
 
-	rows, err := dbCon.Query(c.Request.Context(), "select id, title, done from public.todos;")
+	rows, err := dbPool.Query(c.Request.Context(), "select id, title, done from public.todos;")
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, err)
 		return
@@ -51,14 +52,14 @@ func GetTodo(c *gin.Context) {
 
 	for rows.Next() {
 		if err = rows.Err(); err != nil {
-			c.Error(err)
 			c.AbortWithStatusJSON(http.StatusInternalServerError, err)
+			return
 		}
 		var row Todo
 		err := rows.Scan(&row.Id, &row.Title, &row.Done)
 		if err != nil {
 			c.AbortWithError(500, err)
-			break
+			return
 		}
 		ret = append(ret, row)
 	}
@@ -80,13 +81,13 @@ func PatchTodo(c *gin.Context) {
 		return
 	}
 
-	dbCon, err := GetPostgresConn(c)
+	dbPool, err := GetPostgresConn(c)
 	if err != nil {
 		c.AbortWithError(500, err)
 		return
 	}
 
-	result, err := dbCon.Exec(c.Request.Context(), "update public.todos set title = $1, done = $2 where id = $3", input.Title, input.Done, input.Id)
+	result, err := dbPool.Exec(c.Request.Context(), "update public.todos set title = $1, done = $2 where id = $3", input.Title, input.Done, input.Id)
 	if err != nil {
 		c.AbortWithError(500, err)
 		return

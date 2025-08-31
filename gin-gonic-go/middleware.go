@@ -4,18 +4,52 @@ import (
 	"context"
 	"errors"
 	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp" // Changed from jaeger
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+	"runtime"
 	"time"
 )
+
+// Global connection pool variable
+var pgPool *pgxpool.Pool
+
+// Initialize connection pool
+func InitPgxPool() error {
+	// Configure connection pool
+	config, err := pgxpool.ParseConfig("postgres://local:local@localhost/postgres?pool_max_conns=20&pool_min_conns=5&pool_max_conn_lifetime=1h&pool_max_conn_idle_time=30m")
+	if err != nil {
+		return err
+	}
+
+	// Create the pool
+	pgPool, err = pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		return err
+	}
+
+	// Test the connection
+	err = pgPool.Ping(context.Background())
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Close connection pool
+func ClosePgxPool() {
+	if pgPool != nil {
+		pgPool.Close()
+	}
+}
 
 // Updated to use OTLP trace exporter instead of deprecated Jaeger exporter
 func OTLPTracerProvider() (*sdktrace.TracerProvider, error) {
@@ -66,61 +100,157 @@ func OTLPMetricsProvider() (*sdkmetric.MeterProvider, error) {
 	return provider, nil
 }
 
+// Runtime metrics collection
+func SetupRuntimeMetrics() error {
+	meter := otel.Meter("golang-runtime")
+
+	// Memory metrics
+	memoryUsage, err := meter.Int64ObservableGauge(
+		"runtime_memory_usage_bytes",
+		metric.WithDescription("Current memory usage in bytes"),
+	)
+	if err != nil {
+		return err
+	}
+
+	memoryAllocated, err := meter.Int64ObservableGauge(
+		"runtime_memory_allocated_bytes",
+		metric.WithDescription("Total allocated memory in bytes"),
+	)
+	if err != nil {
+		return err
+	}
+
+	memorySystem, err := meter.Int64ObservableGauge(
+		"runtime_memory_system_bytes",
+		metric.WithDescription("System memory obtained from OS"),
+	)
+	if err != nil {
+		return err
+	}
+
+	// GC metrics
+	gcCount, err := meter.Int64ObservableGauge(
+		"runtime_gc_count_total",
+		metric.WithDescription("Total number of GC cycles"),
+	)
+	if err != nil {
+		return err
+	}
+
+	gcPauseTime, err := meter.Float64ObservableGauge(
+		"runtime_gc_pause_seconds",
+		metric.WithDescription("GC pause time in seconds"),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Goroutine metrics
+	goroutineCount, err := meter.Int64ObservableGauge(
+		"runtime_goroutines_count",
+		metric.WithDescription("Current number of goroutines"),
+	)
+	if err != nil {
+		return err
+	}
+
+	// CPU metrics (approximate)
+	cpuGoroutines, err := meter.Int64ObservableGauge(
+		"runtime_cpu_goroutines",
+		metric.WithDescription("Number of logical CPUs available"),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Connection pool metrics
+	poolTotalConns, err := meter.Int64ObservableGauge(
+		"postgres_pool_total_conns",
+		metric.WithDescription("Total number of connections in pool"),
+	)
+	if err != nil {
+		return err
+	}
+
+	poolIdleConns, err := meter.Int64ObservableGauge(
+		"postgres_pool_idle_conns",
+		metric.WithDescription("Number of idle connections in pool"),
+	)
+	if err != nil {
+		return err
+	}
+
+	poolAcquiredConns, err := meter.Int64ObservableGauge(
+		"postgres_pool_acquired_conns",
+		metric.WithDescription("Number of acquired connections in pool"),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Register callback to collect runtime stats
+	_, err = meter.RegisterCallback(
+		func(ctx context.Context, o metric.Observer) error {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+
+			// Memory metrics
+			o.ObserveInt64(memoryUsage, int64(m.Alloc))
+			o.ObserveInt64(memoryAllocated, int64(m.TotalAlloc))
+			o.ObserveInt64(memorySystem, int64(m.Sys))
+
+			// GC metrics
+			o.ObserveInt64(gcCount, int64(m.NumGC))
+			o.ObserveFloat64(gcPauseTime, float64(m.PauseNs[(m.NumGC+255)%256])/1e9)
+
+			// Goroutine count
+			o.ObserveInt64(goroutineCount, int64(runtime.NumGoroutine()))
+
+			// CPU info
+			o.ObserveInt64(cpuGoroutines, int64(runtime.NumCPU()))
+
+			// Pool metrics
+			if pgPool != nil {
+				stat := pgPool.Stat()
+				o.ObserveInt64(poolTotalConns, int64(stat.TotalConns()))
+				o.ObserveInt64(poolIdleConns, int64(stat.IdleConns()))
+				o.ObserveInt64(poolAcquiredConns, int64(stat.AcquiredConns()))
+			}
+
+			return nil
+		},
+		memoryUsage, memoryAllocated, memorySystem, gcCount, gcPauseTime, goroutineCount, cpuGoroutines,
+		poolTotalConns, poolIdleConns, poolAcquiredConns,
+	)
+
+	return err
+}
+
+// Simplified PostgreSQL middleware that just ensures pool is available
 func PostgresMiddleware() gin.HandlerFunc {
 	tracer := otel.Tracer("postgres-middleware")
-	var con *pgx.Conn = nil
-	var err error
-
-	test := func(ctx context.Context) error {
-		_, span := tracer.Start(ctx, "Ping Postgres")
-		defer span.End()
-		err = con.Ping(ctx)
-		if err != nil {
-			span.RecordError(err)
-			return err
-		}
-		return nil
-	}
-
-	connect := func(ctx context.Context) error {
-		_, span := tracer.Start(ctx, "Verify Postgres Connection")
-		defer span.End()
-		if con == nil {
-			con, err = pgx.Connect(context.Background(), "postgres://local:local@localhost")
-			if err != nil {
-				span.RecordError(err)
-				con = nil
-				return err
-			}
-		}
-		return nil
-	}
 
 	return func(c *gin.Context) {
 		ctx, span := tracer.Start(c.Request.Context(), "PostgresMiddleware")
-		for i := 0; i < 3; i++ {
-			time.Sleep(time.Millisecond * 500 * time.Duration(i))
+		defer span.End()
 
-			err = connect(ctx)
-			if err != nil {
-				continue
-			}
-			err = test(ctx)
-			if err != nil {
-				continue
-			}
-			break
-		}
-
-		// If we still have an error after 3 tries, abort
-		if err != nil {
-			c.AbortWithError(500, err)
-			span.End()
+		// Check if pool is available
+		if pgPool == nil {
+			c.AbortWithError(500, errors.New("Database pool not initialized"))
 			return
 		}
-		span.End()
 
-		c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), "pgxConn", con))
+		// Test pool health (optional - you might skip this in production for performance)
+		err := pgPool.Ping(ctx)
+		if err != nil {
+			span.RecordError(err)
+			c.AbortWithError(500, err)
+			return
+		}
+
+		// Pool is healthy, continue
+		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
 }
@@ -160,15 +290,10 @@ func MetricsMiddleware() gin.HandlerFunc {
 	}
 }
 
-func GetPostgresConn(c *gin.Context) (*pgx.Conn, error) {
-	pgxInt := c.Request.Context().Value("pgxConn")
-	if pgxInt == nil {
-		return nil, errors.New("No Postgres Connection")
+// Updated function to get connection from pool
+func GetPostgresConn(c *gin.Context) (*pgxpool.Pool, error) {
+	if pgPool == nil {
+		return nil, errors.New("Database pool not initialized")
 	}
-	// Validate that it is what we think it should be
-	pgxConn, ok := pgxInt.(*pgx.Conn)
-	if !ok {
-		return nil, errors.New("Postgres Connection is not a *pgx.Conn")
-	}
-	return pgxConn, nil
+	return pgPool, nil
 }
