@@ -8,8 +8,10 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -53,25 +55,22 @@ func ClosePgxPool() {
 
 // Updated to use OTLP trace exporter instead of deprecated Jaeger exporter
 func OTLPTracerProvider() (*sdktrace.TracerProvider, error) {
-	// Create OTLP HTTP trace exporter
-	exp, err := otlptracehttp.New(
-		context.Background(),
-		// The endpoint is configured via OTEL_EXPORTER_OTLP_TRACES_ENDPOINT environment variable
-		// or defaults to http://localhost:4318/v1/traces
-	)
+	// Create stdout exporter to be able to retrieve
+	// the collected spans.
+	exporter, err := otlptrace.New(context.Background(), otlptracehttp.NewClient())
 	if err != nil {
 		return nil, err
 	}
 
+	// For the demonstration, use sdktrace.AlwaysSample sampler to sample all traces.
+	// In a production application, use sdktrace.ProbabilitySampler with a desired probability.
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exp),
-		sdktrace.WithResource(resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceNameKey.String("golang"),
-			semconv.DeploymentEnvironmentKey.String("development"),
-		)),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithBatcher(exporter),
 	)
-	return tp, nil
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+	return tp, err
 }
 
 func OTLPMetricsProvider() (*sdkmetric.MeterProvider, error) {

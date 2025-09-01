@@ -5,3 +5,11 @@ type Todo struct {
 	Title string `json:"title"`
 	Done  bool   `json:"done"`
 }
+
+type Paginated[T any] struct {
+	Data    []T    `json:"data"`
+	Page    int    `json:"page"`
+	Size    int    `json:"size"`
+	Total   int    `json:"total"`
+	Message string `json:"message"`
+}

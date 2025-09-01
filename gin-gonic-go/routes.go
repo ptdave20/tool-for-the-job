@@ -1,11 +1,15 @@
 package main
 
 import (
+	_ "embed"
 	"errors"
 	"github.com/gin-gonic/gin"
 	"net/http"
 	"strconv"
 )
+
+//go:embed queries/get_todos_paginated.sql
+var getTodosPaginatedQuery string
 
 func PostTodo(c *gin.Context) {
 	var input Todo
@@ -20,50 +24,81 @@ func PostTodo(c *gin.Context) {
 		return
 	}
 
-	result, err := dbPool.Exec(c.Request.Context(), "insert into public.todos (title, done) values ($1, $2)", input.Title, input.Done)
+	err = dbPool.QueryRow(c.Request.Context(), "insert into public.todos (title, done) values ($1, $2) RETURNING id;", input.Title, input.Done).Scan(&input.Id)
+
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, err)
 		return
 	}
 
-	if result.RowsAffected() == 0 {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, "No rows affected")
-		return
-	}
-
-	c.Status(http.StatusAccepted)
+	c.JSON(http.StatusAccepted, gin.H{"id": input.Id})
 }
 
 func GetTodo(c *gin.Context) {
-	dbPool, err := GetPostgresConn(c)
-	if err != nil {
-		c.AbortWithError(500, err)
+	// Parse query parameters
+	pageStr := c.DefaultQuery("page", "1")
+	pageSizeStr := c.DefaultQuery("page_size", "10")
+
+	page, err := strconv.Atoi(pageStr)
+	if err != nil || page < 1 {
+		c.JSON(http.StatusBadRequest, Paginated[Todo]{
+			Message: "Invalid page number",
+		})
 		return
 	}
 
-	rows, err := dbPool.Query(c.Request.Context(), "select id, title, done from public.todos;")
+	pageSize, err := strconv.Atoi(pageSizeStr)
+	if err != nil || pageSize < 1 || pageSize > 100 {
+		c.JSON(http.StatusBadRequest, Paginated[Todo]{
+			Message: "Invalid page size (1-100)",
+		})
+		return
+	}
+
+	dbPool, err := GetPostgresConn(c)
+	if err != nil {
+		c.AbortWithError(http.StatusInternalServerError, err)
+		return
+	}
+
+	// Calculate offset
+	offset := (page - 1) * pageSize
+	var totalCount int
+	var items []Todo
+
+	rows, err := dbPool.Query(c.Request.Context(),
+		getTodosPaginatedQuery, pageSize, offset)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusInternalServerError, err)
 		return
 	}
 	defer rows.Close()
 
-	var ret []Todo
-
 	for rows.Next() {
-		if err = rows.Err(); err != nil {
-			c.AbortWithStatusJSON(http.StatusInternalServerError, err)
-			return
-		}
-		var row Todo
-		err := rows.Scan(&row.Id, &row.Title, &row.Done)
+		var todo Todo
+		err := rows.Scan(&todo.Id, &todo.Title, &todo.Done, &totalCount)
 		if err != nil {
-			c.AbortWithError(500, err)
+			c.JSON(http.StatusInternalServerError, Paginated[Todo]{
+				Message: "Error scanning row",
+			})
 			return
 		}
-		ret = append(ret, row)
+		items = append(items, todo)
 	}
-	c.JSON(200, ret)
+
+	if err := rows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, Paginated[Todo]{
+			Message: "Error scanning row",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, Paginated[Todo]{
+		Data:  items,
+		Total: totalCount,
+		Size:  pageSize,
+		Page:  page,
+	})
 }
 
 func PatchTodo(c *gin.Context) {
