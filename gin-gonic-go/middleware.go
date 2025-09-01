@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+	"net/http"
 	"runtime"
 	"time"
 )
@@ -53,7 +54,6 @@ func ClosePgxPool() {
 	}
 }
 
-// Updated to use OTLP trace exporter instead of deprecated Jaeger exporter
 func OTLPTracerProvider() (*sdktrace.TracerProvider, error) {
 	// Create stdout exporter to be able to retrieve
 	// the collected spans.
@@ -236,7 +236,7 @@ func PostgresMiddleware() gin.HandlerFunc {
 
 		// Check if pool is available
 		if pgPool == nil {
-			c.AbortWithError(500, errors.New("Database pool not initialized"))
+			c.AbortWithError(http.StatusInternalServerError, errors.New("Database pool not initialized"))
 			return
 		}
 
@@ -244,12 +244,12 @@ func PostgresMiddleware() gin.HandlerFunc {
 		err := pgPool.Ping(ctx)
 		if err != nil {
 			span.RecordError(err)
-			c.AbortWithError(500, err)
+			c.AbortWithError(http.StatusInternalServerError, err)
 			return
 		}
 
 		// Pool is healthy, continue
-		c.Request = c.Request.WithContext(ctx)
+		c.Request = c.Request.WithContext(context.WithValue(ctx, "pgPool", pgPool))
 		c.Next()
 	}
 }
@@ -289,10 +289,14 @@ func MetricsMiddleware() gin.HandlerFunc {
 	}
 }
 
-// Updated function to get connection from pool
 func GetPostgresConn(c *gin.Context) (*pgxpool.Pool, error) {
-	if pgPool == nil {
+	pgp := c.Request.Context().Value("pgPool")
+	if pgp == nil {
 		return nil, errors.New("Database pool not initialized")
+	}
+	pgPool := pgp.(*pgxpool.Pool)
+	if pgPool == nil {
+		return nil, errors.New("Database pool is nil")
 	}
 	return pgPool, nil
 }
